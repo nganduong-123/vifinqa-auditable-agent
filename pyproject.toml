@@ -3,14 +3,22 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "vifinqa-baseline"
-version = "0.2.0"
-description = "Auditable ViFinQA question taxonomy and OCR-table warehouse"
-requires-python = ">=3.9"
+name = "vifinqa-auditable-agent"
+version = "0.3.0"
+description = "Evidence-first Vietnamese financial QA with auditable Text-to-Pandas execution"
+requires-python = ">=3.11"
+maintainers = [
+  {name = "Duong Thi Ngan"},
+]
+keywords = ["financial-qa", "information-retrieval", "llm", "pandas", "vietnamese-nlp"]
 dependencies = [
   "pandas==2.2.2",
   "rapidfuzz==3.14.5",
 ]
+
+[project.urls]
+Repository = "https://github.com/nganduong-123/vifinqa-auditable-agent"
+Upstream = "https://github.com/Viendeptrai1/lastdance-vifinqa"
 
 [project.scripts]
 vifinqa-corpus = "vifinqa.corpus_db:main"
@@ -19,9 +27,15 @@ vifinqa-l1 = "vifinqa.l1_fact_layer:main"
 vifinqa-experiments = "vifinqa.experiments:main"
 vifinqa-ir = "vifinqa.ir_adapters:main"
 vifinqa-release = "vifinqa.release:main"
+vifinqa-doctor = "vifinqa.diagnostics:main"
+vifinqa-demo = "vifinqa.web_demo:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

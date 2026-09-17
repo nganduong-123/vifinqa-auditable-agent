@@ -12,3 +12,9 @@ def test_parse_two_years():
     assert len(periods) == 2
     assert periods[0].year == 2022
     assert periods[1].year == 2023
+    assert all(period.is_comparative for period in periods)
+
+
+def test_parse_year_range():
+    periods = parse_periods("Lợi nhuận FPT giai đoạn 2019–2023")
+    assert [period.year for period in periods] == [2019, 2020, 2021, 2022, 2023]

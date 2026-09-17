@@ -109,8 +109,8 @@ def build_prompt(
         lines.extend(
             [
                 "RETRIEVAL_CONTEXT dưới đây đã che mọi numeric cell:",
-                "- Mỗi fact phải chọn row_ref có thật và metric phải sao chép label tương ứng.",
-                "- Ghi assumption dạng grounding:<fact_id>=<row_ref> cho từng fact.",
+                "- Mỗi fact phải điền row_ref có thật và metric phải sao chép label tương ứng.",
+                "- row_ref có dạng t<table_id>r<row_index>, lấy đúng từ context.",
                 "- table_kind/unit/header giúp chọn scope, kỳ và đơn vị; không tự bịa row_ref.",
                 "- Không đồng nhất tên dòng với nghĩa câu hỏi: kiểm tra đủ mọi thành phần "
                 "(ví dụ 'ngoại bảng', 'liên quan', 'ròng') trước khi chốt facts.",
@@ -136,6 +136,8 @@ def validate_response(
     try:
         payload = extract_json_object(raw_response)
         plan = FinancialPlanV2.from_dict(payload)
+        if plan.question != question:
+            raise ValueError("Planner changed the original question")
         row["status"] = "VALID"
         row["plan"] = plan.to_dict()
         row["fact_count"] = len(plan.facts)

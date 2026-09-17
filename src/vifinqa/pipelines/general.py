@@ -1,168 +1,199 @@
-"""General pipeline for ViFinQA (handling new questions without ID lock)."""
+"""General ViFinQA pipeline for questions that are not ID-locked.
 
-from typing import Optional
-from pathlib import Path
+The competition release remains reproducible through ``benchmark-locked``.
+This module extends the project with a usable path for new questions: parse,
+retrieve number-masked context, optionally call a planner endpoint, ground the
+returned plan, and emit auditable JSONL results.
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict
 import json
-import sys
 import os
-import requests
+from pathlib import Path
+from typing import Any, Optional
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
-from ..semantic_parser import parse_question
-from ..retrieval_context import RetrievalContextBuilder
-from ..auto_planner import build_prompt
-from ..financial_ir import FinancialPlanV2, compile_pandas, evaluate_plan
+from ..auto_planner import build_prompt, validate_response
+from ..financial_ir import FinancialPlanV2
 from ..grounded_plans import GroundedBinder
-from ..plan_verifier import llm_plan_to_execution_item
+from ..retrieval_context import RetrievalContextBuilder
+from ..semantic_parser import QuestionSpec, parse_question
+
+
+def _post_planner(url: str, prompt: str, timeout: float = 120.0) -> str:
+    payload = json.dumps({"prompts": [prompt], "max_tokens": 2400}).encode("utf-8")
+    request = Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:  # noqa: S310 - configured endpoint
+            body = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError) as error:
+        raise RuntimeError(f"Planner endpoint failed: {error}") from error
+    responses = body.get("responses")
+    if not isinstance(responses, list) or not responses or not isinstance(responses[0], str):
+        raise ValueError("Planner response must contain responses[0] as JSON text")
+    return responses[0]
+
+
+def _spec_payload(spec: QuestionSpec) -> dict[str, Any]:
+    return asdict(spec)
+
+
+def _process_question(
+    *,
+    request_id: int,
+    question: str,
+    builder: RetrievalContextBuilder,
+    database_path: Path,
+    schema: dict[str, Any],
+    modal_url: Optional[str],
+) -> dict[str, Any]:
+    spec = parse_question(question)
+    tickers = {entity.ticker for entity in spec.entities if entity.ticker}
+    record: dict[str, Any] = {
+        "request_id": request_id,
+        "question": question,
+        "analysis": _spec_payload(spec),
+        "status": "ANALYZED_ONLY",
+    }
+
+    if not tickers or not spec.periods:
+        record["error"] = "Question must identify at least one company and year"
+        return record
+
+    try:
+        context = builder.build(
+            question_id=request_id,
+            question=question,
+            tickers=tickers,
+            question_spec=spec,
+        )
+    except Exception as error:
+        record["status"] = "RETRIEVAL_ERROR"
+        record["error"] = str(error)
+        return record
+
+    record["retrieval"] = {
+        "table_count": len(context.get("tables", [])),
+        "table_ids": [table["table_id"] for table in context.get("tables", [])],
+        "number_masked": True,
+    }
+    if not modal_url:
+        return record
+
+    prompt = build_prompt(
+        question=question,
+        tickers=sorted(tickers),
+        schema=schema,
+        context=context,
+    )
+    raw_response = _post_planner(modal_url, prompt)
+    validated = validate_response(
+        raw_response=raw_response,
+        question=question,
+        model=os.environ.get("PLANNER_MODEL", "remote-planner"),
+    )
+    if validated["status"] != "VALID":
+        record["status"] = "PLAN_REJECTED"
+        record["error"] = validated.get("error", "Invalid planner output")
+        return record
+
+    plan = FinancialPlanV2.from_dict(validated["plan"])
+    missing_refs = [fact.id for fact in plan.facts if fact.row_ref is None]
+    if missing_refs:
+        record["status"] = "PLAN_REJECTED"
+        record["error"] = f"Planner facts are missing row_ref: {missing_refs}"
+        return record
+    try:
+        with GroundedBinder(database_path) as binder:
+            result = binder.bind_plan(plan)
+    except Exception as error:
+        record["status"] = "GROUNDING_REJECTED"
+        record["error"] = str(error)
+        return record
+
+    record.update(
+        {
+            "status": "ANSWERED",
+            "answer": result.answer,
+            "output_unit": plan.output_unit,
+            "pandas_query": result.pandas_query,
+            "bindings": [binding.__dict__ for binding in result.bindings],
+            "plan": plan.to_dict(),
+        }
+    )
+    return record
+
 
 def run_general(
     questions_file: Optional[Path],
     output_dir: Path,
     database_path: Path,
 ) -> None:
-    questions = []
-    interactive = False
-    
-    if questions_file and questions_file.exists():
-        with open(questions_file, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                if line.startswith("{"):
-                    questions.append(json.loads(line)["question"])
-                else:
-                    questions.append(line)
-    else:
-        interactive = True
-        print("🚀 Bắt đầu Interactive Mode (Nhánh General) - Gõ 'exit' hoặc 'quit' để thoát")
-    
-    output_dir.mkdir(parents=True, exist_ok=True)
-    modal_url = os.environ.get("MODAL_API_URL")
-    
-    if interactive and modal_url:
-        print(f"🔗 Đã kết nối Modal LLM Endpoint: {modal_url}")
-    elif interactive:
-        print("⚠️ Không tìm thấy MODAL_API_URL. Sẽ chạy chế độ MVP Stub (Không gọi LLM).")
-        
-    schema_path = Path("analysis/financial_plan.schema.json")
-    if not schema_path.exists():
-        # Fallback empty schema if not strictly running from project root
-        schema = {}
-    else:
-        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    """Run batch or interactive analysis and persist every result as JSONL."""
 
+    if not database_path.is_file():
+        raise FileNotFoundError(
+            f"ViFinQA database not found at {database_path}. Build it with vifinqa-corpus first."
+        )
+    schema_path = Path("analysis/financial_plan_v2.schema.json")
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    modal_url = os.environ.get("MODAL_API_URL")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "general_results.jsonl"
+
+    questions: list[str] = []
+    if questions_file:
+        for line in questions_file.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            questions.append(json.loads(line)["question"] if line.startswith("{") else line)
+
+    records: list[dict[str, Any]] = []
     with RetrievalContextBuilder(database_path) as builder:
-        i = 0
-        while True:
-            q_list = questions
-            if interactive:
+        if questions_file:
+            for index, question in enumerate(questions, 1):
+                records.append(
+                    _process_question(
+                        request_id=index,
+                        question=question,
+                        builder=builder,
+                        database_path=database_path,
+                        schema=schema,
+                        modal_url=modal_url,
+                    )
+                )
+        else:
+            print("Interactive mode. Type 'exit' or 'quit' to stop.")
+            while True:
                 try:
-                    q = input("\n[❓] Câu hỏi: ").strip()
+                    question = input("Question: ").strip()
                 except (EOFError, KeyboardInterrupt):
                     break
-                if q.lower() in ("exit", "quit"):
+                if question.lower() in {"exit", "quit"}:
                     break
-                if not q:
+                if not question:
                     continue
-                q_list = [q]
-            else:
-                if i >= len(questions):
-                    break
-                
-            for q in q_list:
-                spec = parse_question(q)
-                tickers = {ent.ticker for ent in spec.entities if ent.ticker}
-                try:
-                    ctx = builder.build(
-                        question_id=i+1,
-                        question=q,
-                        tickers=tickers,
-                        question_spec=spec,
-                    )
-                except Exception as e:
-                    print(f"❌ Retrieval Error: {e}")
-                    ctx = {"tables": []}
-                
-                print(f"\n🔍 [SEMANTIC PARSER]")
-                print(f"   Entities: {spec.entities}")
-                print(f"   Periods:  {spec.periods}")
-                print(f"   Scope:    {spec.scope}")
-                print(f"   Unit:     {spec.output_unit}")
-                
-                print(f"\n📄 [RETRIEVAL]")
-                tables = ctx.get("tables", [])
-                if tables:
-                    print(f"   Tìm thấy {len(tables)} bảng liên quan.")
-                    for t in tables[:2]:  # Show top 2
-                        print(f"   - {t['table_id']} (Score: {t.get('score', 0):.2f})")
-                else:
-                    print("   Không tìm thấy bảng dữ liệu.")
+                record = _process_question(
+                    request_id=len(records) + 1,
+                    question=question,
+                    builder=builder,
+                    database_path=database_path,
+                    schema=schema,
+                    modal_url=modal_url,
+                )
+                records.append(record)
+                print(json.dumps(record, ensure_ascii=False, indent=2))
 
-                if modal_url:
-                    prompt = build_prompt(
-                        question=q,
-                        tickers=sorted(tickers),
-                        schema=schema,
-                        context=ctx,
-                    )
-                    print(f"\n🧠 [LLM PLANNER]")
-                    print("   Đang gọi API Modal...")
-                    try:
-                        resp = requests.post(modal_url, json={"prompts": [prompt], "max_tokens": 2400})
-                        resp.raise_for_status()
-                        raw_json = resp.json()["responses"][0]
-                        # Trim any markdown code blocks
-                        if raw_json.startswith("```json"):
-                            raw_json = raw_json[7:-3]
-                        
-                        plan = FinancialPlanV2.from_dict(json.loads(raw_json))
-                        print(f"   [Thành công] Generated Plan: {plan.facts[0].id if plan.facts else 'No facts'}")
-                        
-                        print(f"\n⚙️ [GROUNDING & EXECUTION]")
-                        try:
-                            with GroundedBinder(database_path) as binder:
-                                bound_plan = binder.bind_plan(plan)
-                                execution = compile_pandas(bound_plan)
-                                
-                                # Dummy dict mapping variables to dummy values for evaluating the DAG
-                                # In reality, we need to execute the pandas script to get `fact_values`
-                                print(f"   Pandas Code:\n{execution.pandas_query}")
-                        except Exception as exec_err:
-                            print(f"   [Execution Error]: {exec_err}")
-
-                    except Exception as e:
-                        print(f"   [Lỗi gọi LLM API]: {e}")
-                else:
-                    # MVP: Single-fact lookup plan stub
-                    if len(spec.entities) == 1 and len(spec.periods) == 1:
-                        from ..financial_ir import FactRequest, PlanNode
-                        
-                        ticker = spec.entities[0].ticker or "UNKNOWN"
-                        year = spec.periods[0].year or 2023
-                        
-                        plan = FinancialPlanV2(
-                            question=q,
-                            facts=(
-                                FactRequest(
-                                    id="f1", 
-                                    ticker=ticker, 
-                                    year=year, 
-                                    metric="UNKNOWN_METRIC", 
-                                    scope=spec.scope, 
-                                    period="end_or_flow", 
-                                    unit=spec.output_unit
-                                ),
-                            ),
-                            nodes=(PlanNode(id="n1", op="identity", inputs=("f1",)),),
-                            output="n1",
-                            output_unit=spec.output_unit,
-                            generator="general_single_fact_lookup"
-                        )
-                        print(f"\n⚙️ [PLANNER STUB]")
-                        print(f"   Plan JSON: {plan.to_json()}")
-                print("-" * 50)
-                
-            if not interactive:
-                i += 1
-            else:
-                pass
+    output_path.write_text(
+        "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    print(json.dumps({"results": str(output_path), "count": len(records)}, ensure_ascii=False))

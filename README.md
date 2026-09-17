@@ -1,4 +1,51 @@
-# lastdance – ViFinQA Text-to-Pandas
+# ViFinQA Auditable Financial Agent
+
+[![CI](https://github.com/nganduong-123/vifinqa-auditable-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/nganduong-123/vifinqa-auditable-agent/actions/workflows/ci.yml)
+
+**Portfolio maintainer:** Dương Thị Ngân<br>
+**Core:** Vietnamese financial question answering, evidence retrieval and safe Text-to-Pandas execution.
+
+This repository is an extended fork of the LastDance ROAD TO AI 2026 Stage 2
+submission. The original Git history and upstream link are retained. The
+portfolio version adds a general-question path, richer intent parsing, a
+dependency-light web demo, project diagnostics, Windows-safe release checks,
+automated tests and CI. See [Portfolio notes](Docs/PORTFOLIO.md) for the exact
+scope of the added work.
+
+## Portfolio demo
+
+The demo runs without the private competition dataset and presents the parsing
+and project-health layers. With the ViFinQA data, SQLite warehouse and planner
+endpoint configured, the existing retrieval, grounding and execution pipeline
+can answer new questions end to end.
+
+```bash
+python -m pip install -e .
+vifinqa-doctor
+vifinqa-demo --port 8000
+```
+
+Open <http://127.0.0.1:8000> and try:
+
+```text
+Tỷ trọng lợi nhuận sau thuế trên doanh thu của FPT năm 2023 là bao nhiêu phần trăm?
+```
+
+![ViFinQA portfolio dashboard](Docs/assets/portfolio-demo.png)
+
+### Portfolio additions
+
+- Structured Vietnamese intent parsing for entities, year ranges, scope,
+  metrics, units, operations, constraints and ambiguity reporting.
+- General pipeline that persists auditable JSONL results and uses grounded
+  plans instead of the previous placeholder execution path.
+- Web dashboard and JSON endpoints: `GET /api/health` and `POST /api/analyze`.
+- Cross-platform locked-plan checksum verification through normalized LF input.
+- Unit, invariance, leakage and diagnostics tests with GitHub Actions CI.
+
+---
+
+## Original competition system
 
 Giải pháp của đội **lastdance** cho ROAD TO AI 2026 – Stage 2: Financial Table Retrieval & Text-to-Pandas Query Generation.
 

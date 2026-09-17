@@ -1,7 +1,11 @@
 """Test ID invariance for the general pipeline."""
 
-import pytest
-from vifinqa.financial_ir import InferenceRequest, FinancialPlanV2
+from vifinqa.financial_ir import (
+    FactRequest,
+    FinancialPlanV2,
+    InferenceRequest,
+    evaluate_plan,
+)
 
 def test_id_invariance():
     """Ensure that InferenceRequest can hold the same question with different IDs."""
@@ -14,6 +18,23 @@ def test_id_invariance():
 
 def test_missing_id():
     """Ensure that a request without an ID returns a valid ANSWERED status."""
-    # Placeholder for Milestone 3/4 solver
-    pass
+    plan = FinancialPlanV2(
+        question="Doanh thu của FPT năm 2023 là bao nhiêu?",
+        facts=(
+            FactRequest(
+                id="revenue",
+                ticker="FPT",
+                year=2023,
+                metric="doanh thu",
+                scope="any",
+                period="flow",
+                unit="VND_1e9",
+            ),
+        ),
+        nodes=(),
+        output="revenue",
+        output_unit="VND_1e9",
+        generator="unit-test",
+    )
+    assert evaluate_plan(plan, {"revenue": 123.0}) == 123.0
 
